@@ -24,6 +24,7 @@ import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { writeSecureFile, appendSecureFile, mkdirSecure } from './file-permissions';
 
 // ─── Thresholds + verdict types ──────────────────────────────
 
@@ -261,11 +262,11 @@ function getDeviceSalt(): string {
     // fall through to generate
   }
   try {
-    fs.mkdirSync(SECURITY_DIR, { recursive: true, mode: 0o700 });
+    mkdirSecure(SECURITY_DIR);
   } catch {}
   cachedSalt = randomBytes(16).toString('hex');
   try {
-    fs.writeFileSync(SALT_FILE, cachedSalt, { mode: 0o600 });
+    writeSecureFile(SALT_FILE, cachedSalt);
   } catch {
     // Can't persist (read-only fs, disk full). Keep the in-memory salt
     // for this process so cross-log correlation still works within a
@@ -331,6 +332,33 @@ function findTelemetryBinary(): string | null {
 }
 
 /**
+ * Build the [cmd, args] tuple for invoking a bash-script telemetry binary
+ * in a way that works on both POSIX and Windows.
+ *
+ * POSIX: returns [bin, args] unchanged — shebang gets honored by execve.
+ * Win32: wraps in bash explicitly. `gstack-telemetry-log` is a shell script
+ * (`#!/usr/bin/env bash`) and Windows `CreateProcess` can't dispatch on a
+ * shebang — it tries to load the file as a PE image, fails with ENOEXEC,
+ * and our 'error' handler silently swallows it. Most Windows dev boxes
+ * running gstack ship Git Bash, which puts bash.exe on PATH; if bash is
+ * missing, spawn() will still fire 'error' and the same swallow path kicks
+ * in. Either way, the local `attempts.jsonl` write in logAttempt() keeps
+ * the audit trail intact.
+ *
+ * Exported for testability — resolution is a pure function of (platform,
+ * bin, args) so we can assert on it without actually spawning.
+ */
+export function buildTelemetrySpawnCommand(
+  bin: string,
+  args: string[],
+): { cmd: string; cmdArgs: string[] } {
+  if (process.platform === 'win32') {
+    return { cmd: 'bash', cmdArgs: [bin, ...args] };
+  }
+  return { cmd: bin, cmdArgs: args };
+}
+
+/**
  * Fire-and-forget subprocess invocation of gstack-telemetry-log with the
  * attack_attempt event type. The binary handles tier gating internally
  * (community → upload, anonymous → local only, off → no-op), so we don't
@@ -343,14 +371,15 @@ function reportAttemptTelemetry(record: AttemptRecord): void {
   const bin = findTelemetryBinary();
   if (!bin) return;
   try {
-    const child = spawn(bin, [
+    const { cmd, cmdArgs } = buildTelemetrySpawnCommand(bin, [
       '--event-type', 'attack_attempt',
       '--url-domain', record.urlDomain || '',
       '--payload-hash', record.payloadHash,
       '--confidence', String(record.confidence),
       '--layer', record.layer,
       '--verdict', record.verdict,
-    ], {
+    ]);
+    const child = spawn(cmd, cmdArgs, {
       stdio: 'ignore',
       detached: true,
     });
@@ -373,10 +402,10 @@ export function logAttempt(record: AttemptRecord): boolean {
   // the event reported (it goes to a different directory anyway).
   reportAttemptTelemetry(record);
   try {
-    fs.mkdirSync(SECURITY_DIR, { recursive: true, mode: 0o700 });
+    mkdirSecure(SECURITY_DIR);
     rotateIfNeeded();
     const line = JSON.stringify(record) + '\n';
-    fs.appendFileSync(ATTEMPTS_LOG, line, { mode: 0o600 });
+    appendSecureFile(ATTEMPTS_LOG, line);
     return true;
   } catch (err) {
     // Non-fatal. Log to stderr for debugging but don't block.
@@ -406,9 +435,9 @@ export interface SessionState {
  */
 export function writeSessionState(state: SessionState): void {
   try {
-    fs.mkdirSync(SECURITY_DIR, { recursive: true, mode: 0o700 });
+    mkdirSecure(SECURITY_DIR);
     const tmp = `${STATE_FILE}.tmp.${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+    writeSecureFile(tmp, JSON.stringify(state, null, 2));
     fs.renameSync(tmp, STATE_FILE);
   } catch (err) {
     console.error('[security] writeSessionState failed:', (err as Error).message);
@@ -449,10 +478,10 @@ export interface DecisionRecord {
 
 export function writeDecision(record: DecisionRecord): void {
   try {
-    fs.mkdirSync(DECISIONS_DIR, { recursive: true, mode: 0o700 });
+    mkdirSecure(DECISIONS_DIR);
     const file = decisionFileForTab(record.tabId);
     const tmp = `${file}.tmp.${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 });
+    writeSecureFile(tmp, JSON.stringify(record));
     fs.renameSync(tmp, file);
   } catch (err) {
     console.error('[security] writeDecision failed:', (err as Error).message);
